@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -30,7 +30,6 @@
 #include <linux/kernel_stat.h>
 #include <linux/tick.h>
 #include <asm/smp_plat.h>
-#include "acpuclock.h"
 #include <linux/suspend.h>
 
 #define MAX_LONG_SIZE 24
@@ -121,8 +120,10 @@ static int update_average_load(unsigned int freq, unsigned int cpu)
 	iowait_time = (unsigned int) (cur_iowait_time - pcpu->prev_cpu_iowait);
 	pcpu->prev_cpu_iowait = cur_iowait_time;
 
+#ifndef CONFIG_MSM_RUN_QUEUE_STATS_BE_CONSERVATIVE
 	if (idle_time >= iowait_time)
 		idle_time -= iowait_time;
+#endif
 
 	if (unlikely(!wall_time || wall_time < idle_time))
 		return 0;
@@ -153,6 +154,38 @@ static int update_average_load(unsigned int freq, unsigned int cpu)
 	return 0;
 }
 
+#ifdef CONFIG_MSM_RUN_QUEUE_STATS_BE_CONSERVATIVE
+
+static unsigned int report_load_at_max_freq(void)
+{
+	int cpu;
+	struct cpu_load_data *pcpu;
+	uint64_t timed_load = 0;
+	unsigned int max_window_size = 0;
+
+	for_each_online_cpu(cpu) {
+		pcpu = &per_cpu(cpuload, cpu);
+
+		mutex_lock(&pcpu->cpu_load_mutex);
+
+		update_average_load(pcpu->cur_freq, cpu);
+
+		timed_load += ((uint64_t) pcpu->avg_load_maxfreq) * pcpu->window_size;
+		if (pcpu->window_size > max_window_size)
+			max_window_size = pcpu->window_size;
+
+		pcpu->avg_load_maxfreq = 0;
+		mutex_unlock(&pcpu->cpu_load_mutex);
+	}
+
+	if (max_window_size == 0)
+		return 0;
+	else
+		return div_u64(timed_load, max_window_size);
+}
+
+#else
+
 static unsigned int report_load_at_max_freq(void)
 {
 	int cpu;
@@ -169,6 +202,8 @@ static unsigned int report_load_at_max_freq(void)
 	}
 	return total_load;
 }
+
+#endif
 
 static int cpufreq_transition_handler(struct notifier_block *nb,
 			unsigned long val, void *data)
@@ -200,7 +235,7 @@ static int cpu_hotplug_handler(struct notifier_block *nb,
 	switch (val) {
 	case CPU_ONLINE:
 		if (!this_cpu->cur_freq)
-			this_cpu->cur_freq = acpuclk_get_rate(cpu);
+			this_cpu->cur_freq = cpufreq_quick_get(cpu);
 	case CPU_ONLINE_FROZEN:
 		this_cpu->avg_load_maxfreq = 0;
 	}
@@ -269,6 +304,10 @@ static void def_work_fn(struct work_struct *work)
 static ssize_t run_queue_avg_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
+#ifdef CONFIG_MSM_RUN_QUEUE_STATS_BE_CONSERVATIVE
+	int nr_running = (avg_nr_running() * 10) >> FSHIFT;
+	return snprintf(buf, PAGE_SIZE, "%d.%d\n", nr_running/10, nr_running%10);
+#else
 	unsigned int val = 0;
 	unsigned long flags = 0;
 
@@ -279,6 +318,7 @@ static ssize_t run_queue_avg_show(struct kobject *kobj,
 	spin_unlock_irqrestore(&rq_lock, flags);
 
 	return snprintf(buf, PAGE_SIZE, "%d.%d\n", val/10, val%10);
+#endif
 }
 
 static struct kobj_attribute run_queue_avg_attr = __ATTR_RO(run_queue_avg);
@@ -393,11 +433,12 @@ static int __init msm_rq_stats_init(void)
 	int ret;
 	int i;
 	struct cpufreq_policy cpu_policy;
+
+#ifndef CONFIG_SMP
 	/* Bail out if this is not an SMP Target */
-	if (!is_smp()) {
-		rq_info.init = 0;
-		return -ENOSYS;
-	}
+	rq_info.init = 0;
+	return -ENOSYS;
+#endif
 
 	rq_wq = create_singlethread_workqueue("rq_stats");
 	BUG_ON(!rq_wq);
@@ -418,7 +459,7 @@ static int __init msm_rq_stats_init(void)
 		cpufreq_get_policy(&cpu_policy, i);
 		pcpu->policy_max = cpu_policy.cpuinfo.max_freq;
 		if (cpu_online(i))
-			pcpu->cur_freq = acpuclk_get_rate(i);
+			pcpu->cur_freq = cpufreq_quick_get(i);
 		cpumask_copy(pcpu->related_cpus, cpu_policy.cpus);
 	}
 	freq_transition.notifier_call = cpufreq_transition_handler;
@@ -436,11 +477,11 @@ late_initcall(msm_rq_stats_init);
 
 static int __init msm_rq_stats_early_init(void)
 {
+#ifndef CONFIG_SMP
 	/* Bail out if this is not an SMP Target */
-	if (!is_smp()) {
-		rq_info.init = 0;
-		return -ENOSYS;
-	}
+	rq_info.init = 0;
+	return -ENOSYS;
+#endif
 
 	pm_notifier(system_suspend_handler, 0);
 	return 0;
